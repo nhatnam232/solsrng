@@ -7,6 +7,7 @@ Cơ chế:
   4. Anti Nitro scam: detect link giả discord/nitro (typosquat)
   5. Anti invite: block discord.gg từ server không whitelist
   6. Anti NSFW: keyword detect trong link/text
+- Tin chỉ là GIF/sticker/ảnh + domain media hợp lệ (Tenor/Giphy/Discord) → BỎ QUA (tránh oan)
 - Owner/Co-owner + whitelist bypass — check TRƯỚC mọi xử lý
 """
 
@@ -29,12 +30,12 @@ log = logging.getLogger("bot.anti_content")
 # CJK: Trung (Hán tự), Nhật (Hiragana/Katakana), Hàn (Hangul)
 CJK_RE = re.compile(
     "["
-    "一-鿿"    # CJK Unified Ideographs (Trung)
-    "㐀-䶿"    # CJK Extension A
-    "぀-ゟ"    # Hiragana (Nhật)
-    "゠-ヿ"    # Katakana (Nhật)
-    "가-힯"    # Hangul Syllables (Hàn)
-    "ᄀ-ᇿ"    # Hangul Jamo
+    "\u4e00-\u9fff"    # CJK Unified Ideographs (Trung)
+    "\u3400-\u4dbf"    # CJK Extension A
+    "\u3040-\u309f"    # Hiragana (Nhật)
+    "\u30a0-\u30ff"    # Katakana (Nhật)
+    "\uac00-\ud7af"    # Hangul Syllables (Hàn)
+    "\u1100-\u11ff"    # Hangul Jamo
     "]"
 )
 
@@ -52,6 +53,14 @@ LEGIT_DISCORD_DOMAINS = {
 # Pattern Nitro scam: domain chứa các từ này nhưng không phải domain thật
 NITRO_SCAM_KEYWORDS = ("discord", "nitro", "dlscord", "discrod", "disc0rd", "steamcommunity")
 LEGIT_SCAM_EXCEPTIONS = LEGIT_DISCORD_DOMAINS | {"steamcommunity.com", "steampowered.com"}
+
+# Domain GIF/media HỢP LỆ — miễn mọi check link (tránh chặn GIF Tenor/Giphy/Discord)
+ALLOWED_MEDIA_DOMAINS = (
+    "tenor.com", "media.tenor.com", "c.tenor.com",
+    "giphy.com", "media.giphy.com",
+    "media.discordapp.net", "cdn.discordapp.com",
+    "images-ext-1.discordapp.net", "images-ext-2.discordapp.net",
+)
 
 # Keyword NSFW cơ bản (check trong link + text)
 NSFW_KEYWORDS = (
@@ -145,6 +154,24 @@ class AntiContent(commands.Cog):
             return True
         return await self.db.is_whitelisted(guild_id, user_id)
 
+    @staticmethod
+    def _is_allowed_media_domain(domain: str) -> bool:
+        """Domain GIF/media hợp lệ (Tenor/Giphy/Discord CDN) — miễn check link."""
+        return any(domain == d or domain.endswith("." + d) for d in ALLOWED_MEDIA_DOMAINS)
+
+    @staticmethod
+    def _is_media_only(message: discord.Message) -> bool:
+        """Tin chỉ là GIF/sticker/ảnh → miễn toàn bộ check nội dung."""
+        if message.stickers:
+            return True
+        text = message.content.strip()
+        if message.attachments and not text:
+            return True
+        # Chỉ chứa 1 link đơn (vd GIF Tenor/Giphy) → coi như media
+        if text and URL_RE.fullmatch(text):
+            return True
+        return False
+
     async def _punish(self, message: discord.Message, reason: str, warn: bool = True):
         """Xóa tin + warn — nhắc trong kênh CHỈ 1 LẦN, tái phạm chỉ ghi log."""
         try:
@@ -214,6 +241,10 @@ class AntiContent(commands.Cog):
             if await self._is_bypassed(guild.id, message.author.id):
                 return
 
+            # GIF/sticker/ảnh đơn thuần → bỏ qua mọi check nội dung (tránh oan member)
+            if self._is_media_only(message):
+                return
+
             content_lower = message.content.lower()
             domains = self._extract_domains(message.content)
 
@@ -240,6 +271,8 @@ class AntiContent(commands.Cog):
         if not await self.db.get_config(message.guild.id, "anticontent_phishing"):
             return False
         for domain in domains:
+            if self._is_allowed_media_domain(domain):
+                continue
             if domain in self._phishing_domains:
                 await self._punish(message, "Link phishing/scam bị chặn!")
                 logger = self.bot.get_cog("Logger")
@@ -259,6 +292,8 @@ class AntiContent(commands.Cog):
         if not await self.db.get_config(message.guild.id, "anticontent_nitro_scam"):
             return False
         for domain in domains:
+            if self._is_allowed_media_domain(domain):
+                continue
             if domain in LEGIT_SCAM_EXCEPTIONS:
                 continue
             # Domain chứa keyword nhạy cảm nhưng KHÔNG phải domain thật → scam
@@ -332,8 +367,10 @@ class AntiContent(commands.Cog):
         if isinstance(message.channel, discord.TextChannel) and message.channel.is_nsfw():
             return False
 
-        # Check domain chứa keyword NSFW
+        # Check domain chứa keyword NSFW (bỏ qua domain media hợp lệ)
         for domain in domains:
+            if self._is_allowed_media_domain(domain):
+                continue
             if any(kw in domain for kw in NSFW_KEYWORDS):
                 await self._punish(message, "Nội dung NSFW bị chặn!")
                 return True

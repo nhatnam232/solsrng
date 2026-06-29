@@ -1,11 +1,14 @@
 """
 cogs/anti_raid.py — Module chống raid.
 Cơ chế khi member join:
-  1. Mass join: 10 người / 20 giây → lockdown toàn server
-  2. Account age: mới hơn 1 ngày → kick
-  3. Pattern name: user123, member123... → quarantine
-  4. Default avatar → quarantine
-  5. Captcha: gán Unverified role → verify trong 60s, không thì kick
+  1. Mass join: nhiều người / window → lockdown + BẬT RAID MODE
+  2. Cụm tên giống nhau join cùng lúc → BẬT RAID MODE (raid dùng tên random/giống nhau)
+  3. Account age: mới hơn ngưỡng → kick
+  4. Pattern name: user123, member123... → quarantine
+  5. Default avatar + account còn mới (kết hợp tín hiệu) → quarantine
+  6. Captcha: gán Unverified role → verify, không thì kick
+- RAID MODE: trong thời gian raid, mọi người join → quarantine thẳng;
+  tự nâng verification level server lên HIGH; tự tắt sau N giây.
 - Owner/Co-owner + whitelist bypass mọi check
 - Invite link từ server lạ do anti_content xử lý
 """
@@ -15,6 +18,7 @@ import time
 import asyncio
 import logging
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from collections import deque
 
 import discord
@@ -40,8 +44,14 @@ class AntiRaid(commands.Cog):
         self.db = bot.db
         # Lịch sử join per guild: {guild_id: deque[timestamp]}
         self._joins: dict = {}
+        # Lịch sử tên người join (gom cụm): {guild_id: deque[(timestamp, name)]}
+        self._recent_names: dict = {}
         # Đang lockdown: set[guild_id] — tránh lockdown lặp
         self._lockdown_guilds: set[int] = set()
+        # Đang RAID MODE: {guild_id: expire_timestamp}
+        self._raid_mode: dict = {}
+        # Verification level cũ để khôi phục sau raid: {guild_id: VerificationLevel}
+        self._prev_verification: dict = {}
         # Task captcha đang chờ: {(guild_id, user_id): asyncio.Task}
         self._pending_captcha: dict = {}
 
@@ -62,6 +72,15 @@ class AntiRaid(commands.Cog):
         logger = self.bot.get_cog("Logger")
         if logger:
             await logger.send_log(guild, title, desc, color, **kw)
+
+    def _in_raid_mode(self, guild_id: int) -> bool:
+        """Guild có đang trong raid mode không (tự dọn nếu hết hạn)."""
+        expire = self._raid_mode.get(guild_id, 0)
+        if expire and expire > time.time():
+            return True
+        if guild_id in self._raid_mode:
+            self._raid_mode.pop(guild_id, None)
+        return False
 
     async def _get_or_create_role(
         self, guild: discord.Guild, config_key: str, name: str,
@@ -117,6 +136,66 @@ class AntiRaid(commands.Cog):
             log.exception("Error quarantining member")
 
     # ========================================================
+    # ⚡ RAID MODE
+    # ========================================================
+    async def _activate_raid_mode(self, guild: discord.Guild, reason: str):
+        """Bật raid mode: nâng verification + hẹn tự tắt."""
+        duration = await self.db.get_config(guild.id, "antiraid_raid_mode_duration")
+        already = self._in_raid_mode(guild.id)
+        self._raid_mode[guild.id] = time.time() + duration
+        if already:
+            return  # đã có task tự tắt chạy, chỉ gia hạn thời gian
+
+        # Nâng verification level lên HIGH (nếu bật)
+        if await self.db.get_config(guild.id, "antiraid_raise_verification"):
+            try:
+                if guild.verification_level < discord.VerificationLevel.high:
+                    self._prev_verification[guild.id] = guild.verification_level
+                    await guild.edit(
+                        verification_level=discord.VerificationLevel.high,
+                        reason=f"Anti-raid: {reason}",
+                    )
+            except (discord.Forbidden, discord.HTTPException):
+                log.warning("Không nâng được verification level cho guild %s", guild.id)
+
+        await self._log(
+            guild, "⚡ BẬT CHẾ ĐỘ CHỐNG RAID",
+            f"**Lý do:** {reason}\nNgười join mới sẽ bị cách ly tự động trong "
+            f"{duration // 60} phút.",
+            discord.Color.red(),
+        )
+        asyncio.create_task(self._auto_disable_raid_mode(guild))
+
+    async def _auto_disable_raid_mode(self, guild: discord.Guild):
+        """Chờ đến khi hết hạn raid mode rồi khôi phục verification level."""
+        try:
+            while True:
+                remaining = self._raid_mode.get(guild.id, 0) - time.time()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(remaining)
+            self._raid_mode.pop(guild.id, None)
+            prev = self._prev_verification.pop(guild.id, None)
+            if prev is not None:
+                try:
+                    await guild.edit(
+                        verification_level=prev,
+                        reason="Anti-raid: hết raid mode",
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+            await self._log(
+                guild, "✅ Tắt chế độ chống raid",
+                "Hết thời gian raid mode — người join mới trở lại quy trình bình thường. "
+                "Mod nhớ `/unlockdown` nếu kênh vẫn đang khóa.",
+                discord.Color.green(),
+            )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("Error auto-disabling raid mode")
+
+    # ========================================================
     # 👋 MAIN — chuỗi check khi member join
     # ========================================================
     @commands.Cog.listener()
@@ -131,8 +210,14 @@ class AntiRaid(commands.Cog):
             if await self._is_bypassed(guild.id, member.id):
                 return
 
-            # 1️⃣ Mass join detect (chạy trước — kể cả member hợp lệ vẫn đếm)
+            # 1️⃣ Mass join + cụm tên giống nhau (có thể bật raid mode)
             await self._check_mass_join(guild)
+            await self._check_name_cluster(guild, member)
+
+            # ⚡ Đang RAID MODE → siết: quarantine thẳng người mới join
+            if self._in_raid_mode(guild.id):
+                await self._quarantine(member, "Server đang ở chế độ chống raid")
+                return
 
             # 2️⃣ Account age — kick nếu account quá mới
             if await self._check_account_age(member):
@@ -144,11 +229,16 @@ class AntiRaid(commands.Cog):
                     await self._quarantine(member, f"Tên nghi vấn: `{member.name}`")
                     return
 
-            # 4️⃣ Default avatar → quarantine
+            # 4️⃣ Default avatar — CHỈ quarantine nếu account còn mới (kết hợp tín hiệu)
             if await self.db.get_config(guild.id, "antiraid_default_avatar_check"):
                 if member.avatar is None:
-                    await self._quarantine(member, "Không có avatar (default)")
-                    return
+                    max_age = await self.db.get_config(
+                        guild.id, "antiraid_default_avatar_max_age")
+                    age = (datetime.now(timezone.utc) - member.created_at).total_seconds()
+                    if age < max_age:
+                        await self._quarantine(
+                            member, "Account mới + không có avatar")
+                        return
 
             # 5️⃣ Captcha verify — gán Unverified, chờ verify
             await self._start_captcha(member)
@@ -156,21 +246,52 @@ class AntiRaid(commands.Cog):
             log.exception("Error in anti-raid on_member_join")
 
     # ========================================================
-    # 1️⃣ MASS JOIN → LOCKDOWN
+    # 1️⃣ MASS JOIN → LOCKDOWN + RAID MODE
     # ========================================================
     async def _check_mass_join(self, guild: discord.Guild):
         threshold = await self.db.get_config(guild.id, "antiraid_join_threshold")
         window = await self.db.get_config(guild.id, "antiraid_join_window")
 
         now = time.time()
-        joins = self._joins.setdefault(guild.id, deque(maxlen=100))
+        joins = self._joins.setdefault(guild.id, deque(maxlen=200))
         joins.append(now)
 
         recent = sum(1 for ts in joins if now - ts <= window)
         if recent >= threshold and guild.id not in self._lockdown_guilds:
             self._lockdown_guilds.add(guild.id)
+            await self._activate_raid_mode(
+                guild, f"Mass join: {recent} người/{window}s")
             await self.lockdown_guild(
                 guild, f"Mass join: {recent} người/{window}s")
+
+    # ========================================================
+    # 2️⃣ CỤM TÊN GIỐNG NHAU → RAID MODE
+    # ========================================================
+    async def _check_name_cluster(self, guild: discord.Guild, member: discord.Member):
+        cluster_count = await self.db.get_config(guild.id, "antiraid_name_cluster_count")
+        if cluster_count <= 0:
+            return
+        sim_threshold = await self.db.get_config(guild.id, "antiraid_name_similarity")
+        window = await self.db.get_config(guild.id, "antiraid_join_window")
+
+        now = time.time()
+        names = self._recent_names.setdefault(guild.id, deque(maxlen=100))
+        name = (member.name or "").lower()
+        names.append((now, name))
+
+        similar = 0
+        for ts, old in names:
+            if now - ts > window:
+                continue
+            if old == name or SequenceMatcher(None, old, name).ratio() * 100 >= sim_threshold:
+                similar += 1
+
+        if similar >= cluster_count and not self._in_raid_mode(guild.id):
+            self._lockdown_guilds.add(guild.id)
+            await self._activate_raid_mode(
+                guild, f"Nhiều tên giống nhau join ({similar})")
+            await self.lockdown_guild(
+                guild, f"Raid: {similar} tên giống nhau join trong {window}s")
 
     async def lockdown_guild(self, guild: discord.Guild, reason: str):
         """Khóa send_messages của @everyone toàn server (cũng dùng cho /lockdown)."""
@@ -221,7 +342,7 @@ class AntiRaid(commands.Cog):
             log.exception("Error during guild unlockdown")
 
     # ========================================================
-    # 2️⃣ ACCOUNT AGE
+    # 3️⃣ ACCOUNT AGE
     # ========================================================
     async def _check_account_age(self, member: discord.Member) -> bool:
         min_age = await self.db.get_config(member.guild.id, "antiraid_min_account_age")
