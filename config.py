@@ -52,8 +52,13 @@ DEFAULT_CONFIG = {
     "antiraid_min_account_age": 86400,     # tuổi account tối thiểu (giây) → kick nếu mới hơn
     "antiraid_captcha_timeout": 600,       # giây chờ verify captcha → kick (10 phút)
     "antiraid_pattern_detect": 1,          # bật detect tên dạng user123/member123 → quarantine
-    "antiraid_default_avatar_check": 1,    # default avatar → quarantine
+    "antiraid_default_avatar_check": 1,    # default avatar → quarantine (kết hợp tuổi account)
+    "antiraid_default_avatar_max_age": 604800,  # CHỈ quarantine default-avatar nếu account < 7 ngày tuổi
     "antiraid_invite_filter": 1,           # xóa invite từ server lạ + warn
+    "antiraid_name_similarity": 88,        # % tên giống nhau để gom thành cụm raid
+    "antiraid_name_cluster_count": 4,      # số tên giống nhau / window → bật raid mode
+    "antiraid_raid_mode_duration": 300,    # raid mode tự tắt sau N giây (5 phút)
+    "antiraid_raise_verification": 1,      # raid mode → nâng verification level server lên HIGH
 
     # ---------- 💣 ANTI-NUKE ----------
     "antinuke_enabled": 1,
@@ -74,18 +79,18 @@ DEFAULT_CONFIG = {
 
    # ---------- 🔁 ANTI-SPAM ----------
     "antispam_enabled": 1,
-    "antispam_dup_limit": 3,               # Giảm xuống 3 tin giống nhau...
-    "antispam_dup_window": 10,             # ...trong hẳn 10 giây -> Chặn đứng bot spam text nhanh
-    "antispam_similarity": 75,             # Giảm xuống 75% để quét các tin cố tình đổi 1-2 ký tự đầu/cuối
-    "antispam_mention_limit": 4,           # Giảm xuống 4 người (Tránh bot mass-ping làm phiền member)
-    "antispam_emoji_limit": 7,             # Giảm xuống 7 emoji (Chặn lũ spam icon phá chat)
+    "antispam_dup_limit": 4,               # 4 tin giống nhau...
+    "antispam_dup_window": 8,              # ...trong 8 giây -> chặn spam text nhanh
+    "antispam_similarity": 80,             # 80% giống nhau mới tính là trùng (bớt oan)
+    "antispam_mention_limit": 6,           # tối đa 6 mention / tin
+    "antispam_emoji_limit": 15,            # 15 emoji / tin (đếm chuẩn theo grapheme)
     "antispam_caps_percent": 80,           # Giữ 80% để member viết chữ hoa ngắn không bị oan
     "antispam_caps_minlen": 8,             # Check từ 8 ký tự trở lên là hợp lý
     "antispam_slowmode_msgs": 7,           # Có 7 tin nhắn liên tục trong channel...
     "antispam_slowmode_window": 5,         # ...chỉ trong vòng 5 giây -> Ép bật slowmode ngay lập tức
     "antispam_slowmode_duration": 15,      # Slowmode hẳn 15 giây để làm nguội phòng chat
-    "antispam_mass_users": 5,              # CHỐNG RAID: Chỉ cần 5 đứa cùng spam 1 nội dung...
-    "antispam_mass_window": 10,            # ...trong vòng 10 giây -> Tự động LOCKDOWN kênh đó luôn!
+    "antispam_mass_users": 8,              # CHỐNG RAID: 8 người cùng spam 1 nội dung...
+    "antispam_mass_window": 15,            # ...trong vòng 15 giây -> Tự động LOCKDOWN kênh đó luôn!
     "antispam_word_repeat": 4,             # 1 từ lặp > 4 lần (ví dụ: "alo alo alo alo") -> Xóa + warn
 
     # ---------- 🈲 ANTI-CONTENT ----------
