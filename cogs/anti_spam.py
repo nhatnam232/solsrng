@@ -1,14 +1,15 @@
 """
 cogs/anti_spam.py — Module chống spam.
 Cơ chế:
-  1. Tin nhắn lặp: 5 tin giống nhau / 5 giây → xóa + warn
-  2. Similarity check: >80% giống nhau → tính là spam
-  3. Mass mention: @everyone/@here hoặc mention >5 người → xóa + warn
-  4. Emoji spam: >10 emoji / tin → xóa + warn
-  5. Caps spam: >70% chữ hoa với tin dài >10 ký tự → xóa + warn
-  6. Auto slowmode: >10 tin/10s trong channel → bật slowmode 10s
-  7. Mass spam: 20+ người spam cùng nội dung / 30s → lockdown channel
-  8. Từ lặp trong câu: 1 từ lặp >5 lần → xóa + warn
+  1. Tin nhắn lặp: N tin giống nhau / window → xóa + warn
+  2. Similarity check: >ngưỡng % giống nhau → tính là spam
+  3. Mass mention: @everyone/@here hoặc mention quá nhiều → xóa + warn
+  4. Emoji spam: > giới hạn emoji / tin → xóa + warn (đếm chuẩn theo grapheme)
+  5. Caps spam: >% chữ hoa với tin dài → xóa + warn
+  6. Auto slowmode: nhiều tin/giây trong channel → bật slowmode
+  7. Mass spam: nhiều người spam cùng nội dung → lockdown channel
+  8. Từ lặp trong câu: 1 từ lặp quá nhiều lần → xóa + warn
+- Tin chỉ là GIF/sticker/ảnh → BỎ QUA check emoji/caps/duplicate (tránh oan member)
 - Owner/Co-owner + whitelist bypass — check TRƯỚC mọi xử lý
 - Mọi threshold lưu SQLite, chỉnh qua slash command
 """
@@ -36,6 +37,14 @@ UNICODE_EMOJI_RE = re.compile(
     "]",
     flags=re.UNICODE,
 )
+# Thành phần bổ trợ KHÔNG tính là emoji riêng
+SKIN_TONE_RE = re.compile("[\U0001F3FB-\U0001F3FF]")   # tông da
+VARIATION_RE = re.compile("[\uFE00-\uFE0F]")            # variation selector
+REGIONAL_RE = re.compile("[\U0001F1E6-\U0001F1FF]")     # regional indicator (cờ)
+ZWJ = "\u200d"                                            # zero-width joiner (ghép emoji)
+
+# Link đơn (dùng để nhận diện tin chỉ là GIF/ảnh link)
+URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 class AntiSpam(commands.Cog):
@@ -66,6 +75,38 @@ class AntiSpam(commands.Cog):
         if config.is_owner_or_coowner(user_id):
             return True
         return await self.db.is_whitelisted(guild_id, user_id)
+
+    @staticmethod
+    def _is_media_only(message: discord.Message) -> bool:
+        """Tin chỉ là GIF/sticker/ảnh (không phải spam chữ) → miễn check emoji/caps/dup."""
+        if message.stickers:
+            return True
+        text = message.content.strip()
+        if message.attachments and not text:
+            return True
+        # Chỉ là 1 link đơn (vd GIF Tenor/Giphy) → coi như media
+        if text and URL_RE.fullmatch(text):
+            return True
+        return False
+
+    @staticmethod
+    def _count_emojis(content: str) -> int:
+        """Đếm emoji theo 'grapheme' — gộp tông da / variation / ZWJ / cờ thành 1."""
+        # Custom emoji <a:name:id> / <:name:id> — mỗi cái = 1
+        custom = len(CUSTOM_EMOJI_RE.findall(content))
+        text = CUSTOM_EMOJI_RE.sub("", content)
+        # Cờ quốc gia: 2 regional indicator = 1 emoji
+        flags = len(REGIONAL_RE.findall(text)) // 2
+        text = REGIONAL_RE.sub("", text)
+        # Bỏ tông da + variation selector (dính vào emoji gốc, không tính riêng)
+        text = SKIN_TONE_RE.sub("", text)
+        text = VARIATION_RE.sub("", text)
+        # Emoji unicode gốc còn lại
+        bases = UNICODE_EMOJI_RE.findall(text)
+        # ZWJ gộp nhiều emoji thành 1 (vd 👨‍👩‍👧) → trừ số lần ghép
+        zwj = text.count(ZWJ)
+        unicode_count = max(0, len(bases) - zwj)
+        return custom + flags + unicode_count
 
     async def _punish(self, message: discord.Message, reason: str):
         """Xóa tin + warn (cooldown 10s) — nhắc trong kênh CHỈ 1 LẦN, sau đó chỉ log."""
@@ -140,17 +181,22 @@ class AntiSpam(commands.Cog):
             if await self._is_bypassed(guild.id, message.author.id):
                 return
 
-            # Chạy lần lượt từng check — check nào dính thì dừng
+            # Tin chỉ là GIF/sticker/ảnh → KHÔNG chạy check cá nhân (tránh oan)
+            media_only = self._is_media_only(message)
+
+            # Mass mention luôn check (kể cả tin media)
             if await self._check_mass_mention(message):
                 return
-            if await self._check_emoji_spam(message):
-                return
-            if await self._check_caps_spam(message):
-                return
-            if await self._check_word_repeat(message):
-                return
-            if await self._check_duplicate(message):
-                return
+
+            if not media_only:
+                if await self._check_emoji_spam(message):
+                    return
+                if await self._check_caps_spam(message):
+                    return
+                if await self._check_word_repeat(message):
+                    return
+                if await self._check_duplicate(message):
+                    return
 
             # Các check cấp channel (không phạt cá nhân)
             await self._check_auto_slowmode(message)
@@ -159,7 +205,7 @@ class AntiSpam(commands.Cog):
             log.exception("Error in anti-spam on_message")
 
     # ========================================================
-    # 1️⃣ + 2️⃣ TIN LẶP + SIMILARITY >80%
+    # 1️⃣ + 2️⃣ TIN LẶP + SIMILARITY
     # ========================================================
     async def _check_duplicate(self, message: discord.Message) -> bool:
         content = self._normalize(message.content)
@@ -208,12 +254,11 @@ class AntiSpam(commands.Cog):
         return False
 
     # ========================================================
-    # 4️⃣ EMOJI SPAM
+    # 4️⃣ EMOJI SPAM (đếm chuẩn theo grapheme)
     # ========================================================
     async def _check_emoji_spam(self, message: discord.Message) -> bool:
         emoji_limit = await self.db.get_config(message.guild.id, "antispam_emoji_limit")
-        count = len(CUSTOM_EMOJI_RE.findall(message.content))
-        count += len(UNICODE_EMOJI_RE.findall(message.content))
+        count = self._count_emojis(message.content)
         if count > emoji_limit:
             await self._punish(message, f"Spam emoji ({count} emoji)!")
             return True
@@ -252,7 +297,7 @@ class AntiSpam(commands.Cog):
         return False
 
     # ========================================================
-    # 6️⃣ AUTO SLOWMODE — >10 tin/10s trong channel
+    # 6️⃣ AUTO SLOWMODE — nhiều tin/giây trong channel
     # ========================================================
     async def _check_auto_slowmode(self, message: discord.Message):
         guild_id = message.guild.id
@@ -300,7 +345,7 @@ class AntiSpam(commands.Cog):
             log.exception("Error setting auto slowmode")
 
     # ========================================================
-    # 7️⃣ MASS SPAM — 20+ người spam cùng nội dung/30s → lockdown channel
+    # 7️⃣ MASS SPAM — nhiều người spam cùng nội dung → lockdown channel
     # ========================================================
     async def _check_mass_spam(self, message: discord.Message):
         content = self._normalize(message.content)
