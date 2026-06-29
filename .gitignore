@@ -1,0 +1,30 @@
+# Secrets — KHÔNG BAO GIỜ push file này
+.env
+
+# Môi trường / thư viện cài đặt cục bộ
+.local/
+.cache/
+.venv/
+venv/
+env/
+
+# Python tạm
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Dữ liệu runtime của bot
+data/bot.db
+data/backups/
+*.sqlite
+*.sqlite3
+
+# File nén
+*.tar
+*.tar.gz
+*.zip
+
+# Log / OS
+*.log
+.DS_Store
+Thumbs.db
